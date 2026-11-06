@@ -180,6 +180,8 @@ struct Cx {
     state: Arc<AppState>,
     chat: ChatId,
     user: u64,
+    /// « @pseudo (ID) » pour les journaux.
+    who: String,
     platform: Platform,
     progress: Option<MessageId>,
     /// Message de l'utilisateur auquel le bot répond (comme `reply_to_message_id` du bot Python).
@@ -203,9 +205,18 @@ impl Cx {
                 req.await.map(|m| self.progress = Some(m.id))
             }
         };
-        if let Err(e) = r {
-            let err = self.redact(e.to_string());
-            tracing::warn!(user_id = self.user, error = %err, "message de progression non envoyé");
+        match r {
+            Ok(()) => {}
+            // Anti-flood de Telegram : cette étape de progression est sautée, la suivante passera.
+            Err(teloxide::RequestError::RetryAfter(s)) => tracing::warn!(
+                user = %self.who,
+                "progression non mise à jour : limitation de Telegram (trop de messages), attente imposée de {} s",
+                s.seconds()
+            ),
+            Err(e) => {
+                let err = self.redact(e.to_string());
+                tracing::warn!(user = %self.who, error = %err, "message de progression non envoyé");
+            }
         }
     }
 
@@ -223,7 +234,7 @@ impl Cx {
     /// Jamais de silence : l'erreur finit chez l'utilisateur.
     async fn fail(&mut self, f: Failure) {
         let err = self.redact(f.detail);
-        tracing::warn!(user_id = self.user, platform = ?self.platform, error = %err, "tâche en échec");
+        tracing::warn!(user = %self.who, platform = ?self.platform, error = %err, "tâche en échec");
         if f.fresh {
             self.clear().await;
             self.say(&f.user).await;
@@ -234,14 +245,30 @@ impl Cx {
 
     /// Nouveau message, comme `update.message.reply_text` de python-telegram-bot 13.
     async fn say(&self, text: &str) {
-        let mut req = self.bot.send_message(self.chat, text);
-        if let Some(id) = self.reply_to.filter(|_| !self.chat.is_user()) {
-            req = req.reply_parameters(ReplyParameters::new(id).allow_sending_without_reply());
+        // Un message final (lien, erreur) ne doit pas se perdre sur l'anti-flood : on attend et on renvoie.
+        for _ in 0..3 {
+            let mut req = self.bot.send_message(self.chat, text);
+            if let Some(id) = self.reply_to.filter(|_| !self.chat.is_user()) {
+                req = req.reply_parameters(ReplyParameters::new(id).allow_sending_without_reply());
+            }
+            match req.await {
+                Ok(_) => return,
+                Err(teloxide::RequestError::RetryAfter(s)) => {
+                    tracing::warn!(
+                        user = %self.who,
+                        "message en attente : limitation de Telegram (trop de messages), renvoi dans {} s",
+                        s.seconds()
+                    );
+                    tokio::time::sleep(s.duration()).await;
+                }
+                Err(e) => {
+                    let err = self.redact(e.to_string());
+                    tracing::warn!(user = %self.who, error = %err, "message non envoyé");
+                    return;
+                }
+            }
         }
-        if let Err(e) = req.await {
-            let err = self.redact(e.to_string());
-            tracing::warn!(user_id = self.user, error = %err, "message non envoyé");
-        }
+        tracing::warn!(user = %self.who, "message non envoyé : limitation de Telegram toujours active après 3 essais");
     }
 
     /// Envoi chez l'hébergeur externe avec progression puis lien (textes de utils/upload.py).
@@ -458,21 +485,15 @@ fn job_id(user: u64) -> String {
 }
 
 /// Lance une tâche indépendante : un téléchargement ne bloque jamais le dispatcher.
-fn spawn_job(
-    bot: Bot,
-    state: Arc<AppState>,
-    chat: ChatId,
-    reply_to: MessageId,
-    user: u64,
-    raw: String,
-    mode: Mode,
-) {
+fn spawn_job(bot: Bot, state: Arc<AppState>, msg: &Message, user: u64, raw: String, mode: Mode) {
+    let (chat, reply_to, who) = (msg.chat.id, msg.id, who(msg));
     tokio::spawn(async move {
         let mut cx = Cx {
             bot,
             state,
             chat,
             user,
+            who,
             platform: Platform::Generic,
             progress: None,
             reply_to: Some(reply_to),
@@ -520,7 +541,7 @@ async fn job(cx: &mut Cx, raw: &str, mode: Mode) -> Result<(), Failure> {
             // Déjà chez l'hébergeur externe : on redonne le lien, sans retélécharger ni renvoyer.
             tracing::info!(
                 "[{tag}] Lien externe déjà créé pour l'URL: {url} par {}. Envoi du lien depuis le cache.",
-                cx.user
+                cx.who
             );
             cx.clear().await;
             cx.say(&format!(
@@ -532,7 +553,7 @@ async fn job(cx: &mut Cx, raw: &str, mode: Mode) -> Result<(), Failure> {
         }
         tracing::info!(
             "[{tag}] Fichier déjà téléchargé pour l'URL: {url} par {}. Envoi depuis le cache.",
-            cx.user
+            cx.who
         );
         cx.status("📦 Utilisation du cache...").await;
         let kind = match mode {
@@ -553,7 +574,7 @@ async fn job(cx: &mut Cx, raw: &str, mode: Mode) -> Result<(), Failure> {
                 return Ok(());
             }
             Err(f) => {
-                tracing::warn!(user_id = cx.user, error = %f.detail, "file_id du cache refusé, retéléchargement");
+                tracing::warn!(user = %cx.who, error = %f.detail, "file_id du cache refusé, retéléchargement");
                 cx.status("⏳ Téléchargement en cours...").await;
             }
         }
@@ -589,7 +610,7 @@ async fn job(cx: &mut Cx, raw: &str, mode: Mode) -> Result<(), Failure> {
     for attempt in 1..=3 {
         tracing::info!(
             "[{tag}] Tentative {attempt} de téléchargement pour l'URL: {url} par {}",
-            cx.user
+            cx.who
         );
         match state.downloader.fetch(&url, mode, &job).await {
             Ok(d) => {
@@ -599,7 +620,7 @@ async fn job(cx: &mut Cx, raw: &str, mode: Mode) -> Result<(), Failure> {
             Err(e) => {
                 tracing::error!(
                     "[{tag}] Tentative {attempt} échouée pour l'URL: {url} par {} - {e}",
-                    cx.user
+                    cx.who
                 );
                 // Réessayer ne changerait rien : on le dit tout de suite, avec le message précis.
                 if matches!(
@@ -675,7 +696,7 @@ async fn job(cx: &mut Cx, raw: &str, mode: Mode) -> Result<(), Failure> {
                         tracing::error!(
                             "[MUSIC] Erreur conversion en audio pour {} par {} - {e}",
                             dl.path.display(),
-                            cx.user
+                            cx.who
                         );
                         Failure {
                             user: "❌ Erreur lors de la conversion en audio.".into(),
@@ -686,7 +707,7 @@ async fn job(cx: &mut Cx, raw: &str, mode: Mode) -> Result<(), Failure> {
                 tracing::info!(
                     "[MUSIC] Conversion terminée: {} pour {}",
                     mp3.display(),
-                    cx.user
+                    cx.who
                 );
                 mp3
             }
@@ -809,12 +830,17 @@ fn reply(bot: &Bot, msg: &Message, text: impl Into<String>) -> <Bot as Requester
 }
 
 /// Nom de l'utilisateur dans les journaux (pseudo, sinon ID), comme `from_user.username`.
+/// Pour les journaux : « @pseudo (ID) », ou le prénom sans pseudo Telegram (demande de Tom).
+fn who_of(u: &teloxide::types::User) -> String {
+    let name = u
+        .username
+        .as_ref()
+        .map_or_else(|| u.first_name.clone(), |n| format!("@{n}"));
+    format!("{name} ({})", u.id.0)
+}
+
 fn who(msg: &Message) -> String {
-    msg.from.as_ref().map_or_else(String::new, |u| {
-        u.username
-            .clone()
-            .map_or_else(|| u.id.0.to_string(), |n| format!("@{n}"))
-    })
+    msg.from.as_ref().map_or_else(String::new, who_of)
 }
 
 /// Premier argument, comme `context.args[0]` du bot Python.
@@ -857,7 +883,7 @@ async fn settings_callback(
     let user = q.from.id.0;
     if !state.access.is_admin(user) {
         tracing::warn!(
-            user_id = user,
+            user = %who_of(&q.from),
             "bouton /settings refusé : pas administrateur"
         );
         return Ok(());
@@ -940,6 +966,7 @@ pub async fn handle_callback(
             state: state.clone(),
             chat,
             user,
+            who: who_of(&q.from),
             platform: Platform::Generic,
             progress: Some(mid),
             reply_to: None,
@@ -989,10 +1016,7 @@ pub async fn handle_command(
                     .parse_mode(mode)
                     .await?;
             } else {
-                tracing::warn!(
-                    "[STATS] Tentative non autorisée par {} (id={user})",
-                    who(&msg)
-                );
+                tracing::warn!("[STATS] Tentative non autorisée par {}", who(&msg));
                 // Texte d'origine de commands/stats.py.
                 reply(
                     &bot,
@@ -1052,15 +1076,7 @@ pub async fn handle_command(
                 first_token(&arg),
                 who(&msg)
             );
-            spawn_job(
-                bot,
-                state,
-                chat,
-                msg.id,
-                user,
-                first_token(&arg),
-                Mode::Video,
-            );
+            spawn_job(bot, state, &msg, user, first_token(&arg), Mode::Video);
         }
         Command::Music(arg) => {
             tracing::info!(
@@ -1068,15 +1084,7 @@ pub async fn handle_command(
                 first_token(&arg),
                 who(&msg)
             );
-            spawn_job(
-                bot,
-                state,
-                chat,
-                msg.id,
-                user,
-                first_token(&arg),
-                Mode::Audio,
-            );
+            spawn_job(bot, state, &msg, user, first_token(&arg), Mode::Audio);
         }
     }
     Ok(())
@@ -1107,7 +1115,7 @@ pub async fn handle_text(bot: Bot, msg: Message, state: Arc<AppState>) -> Respon
         tracing::info!(
             "URL détectée dans le message : {url}, lancement du téléchargement automatique."
         );
-        spawn_job(bot, state, msg.chat.id, msg.id, user, url, Mode::Video);
+        spawn_job(bot, state, &msg, user, url, Mode::Video);
     }
     Ok(())
 }
@@ -1139,6 +1147,15 @@ mod tests {
             Err(AccessError::RateLimited { retry_after_s: 7 })
         ));
         assert!(admit(true, || Ok(())).is_ok());
+    }
+
+    #[test]
+    fn journal_pseudo_puis_id() {
+        let user = |j: &str| serde_json::from_str::<teloxide::types::User>(j).unwrap();
+        let avec = user(r#"{"id":111111111,"is_bot":false,"first_name":"Tom","username":"tomv"}"#);
+        assert_eq!(who_of(&avec), "@tomv (111111111)");
+        let sans = user(r#"{"id":111111111,"is_bot":false,"first_name":"Tom"}"#);
+        assert_eq!(who_of(&sans), "Tom (111111111)");
     }
 
     #[test]
